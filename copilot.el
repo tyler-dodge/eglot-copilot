@@ -165,17 +165,18 @@ Used to dedupe the `copilot-panel-solutions--accumulator'.")
         (setq copilot-panel--target-buffer target-buffer)))
     (setq copilot-panel-solutions--accumulator nil)
     (setq copilot-panel-solutions--ids (ht))
-    (jsonrpc-async-request (copilot-shadow-eglot-server) :getPanelCompletions
-                           (append
-                            (list
-                             :panelId "copilot:///1"
-                             :doc
-                             (list :path (buffer-file-name)
-                                   :position (eglot--pos-to-lsp-position)
-                                   :uri (eglot--path-to-uri (buffer-file-name)))
-                             )
-                            (eglot--TextDocumentPositionParams) nil)
-                           :deferred :getPanelCompletions)))
+    (-some--> (copilot-shadow-eglot-server)
+      (jsonrpc-async-request it :getPanelCompletions
+                             (append
+                              (list
+                               :panelId "copilot:///1"
+                               :doc
+                               (list :path (buffer-file-name)
+                                     :position (eglot--pos-to-lsp-position)
+                                     :uri (eglot--path-to-uri (buffer-file-name)))
+                               )
+                              (eglot--TextDocumentPositionParams) nil)
+                             :deferred :getPanelCompletions))))
 
 ;;;###autoload
 (defun copilot-sort-results-company-transformer (results)
