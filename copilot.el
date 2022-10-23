@@ -178,13 +178,18 @@ Used to dedupe the `copilot-panel-solutions--accumulator'.")
                               (eglot--TextDocumentPositionParams) nil)
                              :deferred :getPanelCompletions))))
 
+
+(defun copilot--first-token (text)
+  (or (-some--> (string-match copilot--token-delimiter-regexp text) (substring text 0 it))
+      text))
+
 ;;;###autoload
 (defun copilot-sort-results-company-transformer (results)
   "Company transformer for sorting results based on the output from copilot.
 See `company-transformers'."
   (when results
     (->> results
-         (--map (cons (ht-get copilot--result-token-cache (car (s-split-up-to copilot--token-delimiter-regexp it 1 t))) it))
+         (--map (cons (ht-get copilot--result-token-cache (copilot--first-token it)) it))
          (--sort
           (let ((it-in-cache (car it))
                 (other-in-cache (car other)))
