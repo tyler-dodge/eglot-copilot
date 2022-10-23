@@ -104,8 +104,8 @@ Used to dedupe the `copilot-panel-solutions--accumulator'.")
     (sorted t)
     (post-completion
      (let* ((inhibit-modification-hooks t))
-       (delete-char (- (length arg)))
        (atomic-change-group
+         (delete-char (- (length arg)))
          (let* ((range (get-text-property 0 :range arg))
                 (inhibit-modification-hooks t)
                 (start-pt (point))
@@ -183,24 +183,35 @@ Used to dedupe the `copilot-panel-solutions--accumulator'.")
   (or (-some--> (string-match copilot--token-delimiter-regexp text) (substring text 0 it))
       text))
 
+(defun copilot-tokenize (text)
+  (let ((target text)
+        (acc nil))
+    (while (> (length target) 0)
+      (if-let ((index (string-match copilot--token-delimiter-regexp target)))
+          (progn
+            (if (eq index 0)
+                (while (eq (string-match copilot--token-delimiter-regexp target) 0)
+                  (setq target (substring target 1)))
+              (push (substring target 0 index) acc)
+              (setq target (substring target index))))
+        (push target acc) 
+        (setq target nil)))
+    acc))
+
 ;;;###autoload
 (defun copilot-sort-results-company-transformer (results)
   "Company transformer for sorting results based on the output from copilot.
 See `company-transformers'."
-  (when results
-    (->> results
-         (--map (cons (ht-get copilot--result-token-cache (copilot--first-token it)) it))
-         (--sort
-          (let ((it-in-cache (car it))
-                (other-in-cache (car other)))
-            (cond
-             ((and it-in-cache other-in-cache) nil)
-             (it-in-cache t)
-             (other-in-cache nil)
-             (t nil))))
-         (--map (if (car it)
-                    (cdr it)
-                  (cdr it))))))
+  (or results
+      (when results
+        (let ((copilot-results nil)
+              (normal-results nil))
+          (cl-loop for result in results
+                   do
+                   (if (ht-get copilot--result-token-cache (copilot--first-token result))
+                       (push result copilot-results)
+                     (push result normal-results)))
+          (append copilot-results normal-results nil)))))
 
 (define-derived-mode copilot-shadow-mode fundamental-mode "copilot-shadow"
   "Mode used by shadow buffers for copilot.")
@@ -288,15 +299,16 @@ See `company-transformers'."
 
 (defun copilot-shadow--eglot-ensure (language-id)
   "Ensures that eglot is enabled. If it isn't, then start it for `copilot-shadow-mode'."
-  (or (eglot-managed-p)
-      (and (eglot-current-server) (prog1 t (eglot--maybe-activate-editing-mode)))
-      (eglot
-       #'copilot-shadow-mode
-       (cons 'projectile
-             (project-root (project-current)))
-       #'eglot-lsp-server
-       (copilot-shadow-mode-server-command)
-       (or language-id "copilot") t)))
+  (when language-id
+    (or (eglot-managed-p)
+        (and (eglot-current-server) (prog1 t (eglot--maybe-activate-editing-mode)))
+        (eglot
+         #'copilot-shadow-mode
+         (cons 'projectile
+               (project-root (project-current)))
+         #'eglot-lsp-server
+         (copilot-shadow-mode-server-command)
+         (or language-id "copilot") t))))
 
 (defun copilot--before-change-hook (beg end)
   "before-change-functions hook for forwarding `eglot--before-change' to the shadow buffer."
@@ -399,9 +411,9 @@ the current `copilot-panel-solutions--accumulator' and `copilot-panel-solutions'
   (cl-loop for solution in (append copilot-panel-solutions copilot-panel-solutions--accumulator nil)
            do
            (cl-loop 
-            for word in (when solution (s-split copilot--token-delimiter-regexp (get-text-property 0 :insertText (cdr solution)) t))
+            for word in (when solution (copilot-tokenize (get-text-property 0 :insertText (cdr solution))))
             do
-            (ht-set copilot--result-token-cache (s-trim word) t))))
+            (ht-set copilot--result-token-cache word t))))
 
 (defun copilot--replace-text (selection &optional highlight-replacement)
   "Replaces the text referenced by SELECTION. If HIGHLIGHT-REPLACEMENT is non-nil,
