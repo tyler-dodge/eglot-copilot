@@ -122,37 +122,38 @@ Used to dedupe the `copilot-panel-solutions--accumulator'.")
              (save-excursion
                (indent-region start-pt (point))))))))
     (candidates
-     (let ((server (copilot-shadow-eglot-server))
-           (current-pt (point))
-           (shadow-buffer (copilot--shadow-buffer (current-buffer))))
-       (with-current-buffer shadow-buffer
-         (goto-char current-pt))
-       (cons :async
-             (lambda (callback)
-               (with-current-buffer shadow-buffer
-                 (eglot--signal-textDocument/didChange)
-                 (jsonrpc-async-request
-                  (eglot-current-server)
-                  :getCompletions
-                  (append
-                   (list
-                    :doc
-                    (list :path (buffer-file-name)
-                          :position (eglot--pos-to-lsp-position)
-                          :uri (eglot--path-to-uri (buffer-file-name)))
-                    )
-                   (eglot--TextDocumentPositionParams) nil)
-                  :success-fn
-                  (lambda (response &rest arg)
-                    (funcall
-                     callback
-                     (->> (append (plist-get response :completions) nil)
-                          (--map
-                           (propertize
-                            (s-truncate 100 (plist-get it :displayText))
-                            :range (plist-get it :range)
-                            :insertText (plist-get it :text))))))
-                  :error-fn (lambda (&rest arg) (-message arg))))))))))
+     (-some--> (copilot-shadow-eglot-server)
+       (let ((server it)
+             (current-pt (point))
+             (shadow-buffer (copilot--shadow-buffer (current-buffer))))
+         (with-current-buffer shadow-buffer
+           (goto-char current-pt))
+         (cons :async
+               (lambda (callback)
+                 (with-current-buffer shadow-buffer
+                   (eglot--signal-textDocument/didChange)
+                   (jsonrpc-async-request
+                    (eglot-current-server)
+                    :getCompletions
+                    (append
+                     (list
+                      :doc
+                      (list :path (buffer-file-name)
+                            :position (eglot--pos-to-lsp-position)
+                            :uri (eglot--path-to-uri (buffer-file-name)))
+                      )
+                     (eglot--TextDocumentPositionParams) nil)
+                    :success-fn
+                    (lambda (response &rest arg)
+                      (funcall
+                       callback
+                       (->> (append (plist-get response :completions) nil)
+                            (--map
+                             (propertize
+                              (s-truncate 100 (plist-get it :displayText))
+                              :range (plist-get it :range)
+                              :insertText (plist-get it :text))))))
+                    :error-fn (lambda (&rest arg) (-message arg)))))))))))
 
 ;;;###autoload
 (defun copilot-panel-refresh ()
@@ -218,8 +219,11 @@ See `company-transformers'."
 
 (defun copilot-shadow-eglot-server ()
   "Return the eglot server used by the shadow buffer for the current buffer."
-  (with-current-buffer (copilot--shadow-buffer (current-buffer))
-    (eglot-current-server)))
+
+  (-some--> 
+      (copilot--shadow-buffer (current-buffer))
+      (with-current-buffer it
+        (eglot-current-server))))
 
 (defun copilot-shadow-kill ()
   "Kills the shadow buffer for the current buffer."
@@ -262,9 +266,10 @@ See `company-transformers'."
       (setq-local before-change-functions (-uniq (cons #'copilot--before-change-hook before-change-functions)))
       (setq-local after-change-functions (-uniq (cons #'copilot--after-change-hook after-change-functions)))
       (if (and copilot--shadow-buffer (buffer-live-p copilot--shadow-buffer)
-               (with-current-buffer copilot--shadow-buffer
-                 (copilot-shadow--eglot-ensure (-some--> (eglot-current-server) (eglot--language-id it)))))
-          copilot--shadow-buffer
+               )
+          (with-current-buffer copilot--shadow-buffer
+            (when (copilot-shadow--eglot-ensure (-some--> (eglot-current-server) (eglot--language-id it)))
+              copilot--shadow-buffer))
         (let (
               (language-id (-some--> (eglot-current-server) (eglot--language-id it)))
               (copied
@@ -312,27 +317,29 @@ See `company-transformers'."
 
 (defun copilot--before-change-hook (beg end)
   "before-change-functions hook for forwarding `eglot--before-change' to the shadow buffer."
-  (let ((start-buffer (current-buffer))
-        (copied (buffer-substring beg end)))
-    (with-current-buffer (copilot--shadow-buffer start-buffer)
-      (ignore-errors (eglot--before-change beg end)))))
+  (-some--> (copilot--shadow-buffer (current-buffer))
+    (let ((server it)
+          (copied (buffer-substring beg end)))
+      (with-current-buffer shadow
+          (ignore-errors (eglot--before-change beg end))))))
 
 (defun copilot--after-change-hook (beg end length)
   "after-change-functions hook for forwarding `eglot--after-change' to the shadow buffer."
-  (let ((start-buffer (current-buffer))
-        (copied (buffer-substring beg end)))
-    (with-current-buffer (copilot--shadow-buffer start-buffer)
-      (let ((pt (point)))
-        (save-excursion
-          (let ((inhibit-modification-hooks t)
-                (inhibit-point-motion-hooks t)
-                (inhibit-read-only t))
-            (goto-char beg)
-            (delete-char length)
-            (insert copied)
-            (ignore-errors (eglot--after-change beg end length))
-            (set-buffer-modified-p nil)))
-        (goto-char pt)))))
+  (-some--> (copilot--shadow-buffer (current-buffer))
+    (let ((shadow it)
+          (copied (buffer-substring beg end)))
+      (with-current-buffer shadow
+          (let ((pt (point)))
+            (save-excursion
+              (let ((inhibit-modification-hooks t)
+                    (inhibit-point-motion-hooks t)
+                    (inhibit-read-only t))
+                (goto-char beg)
+                (delete-char length)
+                (insert copied)
+                (ignore-errors (eglot--after-change beg end length))
+                (set-buffer-modified-p nil)))
+            (goto-char pt))))))
 
 (defun copilot-shadow-kill-buffer-hook ()
   "Handles killing the copilot shadow buffer when the owner buffer is killed."
