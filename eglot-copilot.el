@@ -31,6 +31,12 @@ Used to dedupe the `copilot-panel-solutions--accumulator'.")
 (defvar copilot-panel-id-to-buffer (ht)
   "Maps the given panel id to a buffer object.")
 
+(defvar copilot-buffer-to-panel-id (ht)
+  "Maps a buffer object to its panel id.")
+
+(defvar copilot-panel-id-counter 1
+  "Counter for the next panel id")
+
 (defvar copilot-panel--idle-timer nil
   "Timer that handles refreshing the copilot panel.")
 
@@ -46,6 +52,9 @@ Used to dedupe the `copilot-panel-solutions--accumulator'.")
 (defvar-local copilot-panel--target-buffer nil
   "The target buffer for the current copilot-panel")
 
+(defvar-local copilot-panel--target-panel nil
+  "The target panelId for the current copilot-panel")
+
 ;;;###autoload
 (defun copilot-setup ()
   "Setup the copilot integration to ensure the best user experience."
@@ -59,6 +68,8 @@ Used to dedupe the `copilot-panel-solutions--accumulator'.")
 (defun counsel-copilot ()
   "Runs ivy to preview results from copilot."
   (interactive)
+  (unless (eq (buffer-local-value 'copilot-panel--target-buffer copilot-panel-buffer) (-message (current-buffer)))
+    (user-error "No copilot results yet for current buffer."))
   (ivy-read
    "Copilot:"
    (->> copilot-panel-solutions
@@ -70,6 +81,8 @@ Used to dedupe the `copilot-panel-solutions--accumulator'.")
    :require-match t
    :action #'counsel-copilot--preview-select-action
    :caller 'counsel-copilot))
+
+(ivy-set-actions 'counsel-copilot '(("c" counsel-copilot--commit-action "Commit")))
 
 ;;;###autoload
 (defun copilot-sign-in ()
@@ -155,29 +168,46 @@ Used to dedupe the `copilot-panel-solutions--accumulator'.")
                               :insertText (plist-get it :text))))))
                     :error-fn (lambda (&rest arg) (-message arg)))))))))))
 
+(defun copilot--enabled-in-buffer-p ()
+  (and (derived-mode-p #'prog-mode)
+       (not buffer-read-only)
+       (buffer-file-name)
+       (projectile-project-root)
+       (not (string= "class" (file-name-extension (buffer-file-name))))
+       (condition-case err (copilot--shadow-buffer (current-buffer))
+         (error nil))))
+
 ;;;###autoload
 (defun copilot-panel-refresh ()
   "Refresh the copilot suggestions buffer for the current buffer."
   (interactive)
-  (when (buffer-file-name)
+  (when (copilot--enabled-in-buffer-p)
     (unless (and copilot-panel-buffer (buffer-live-p copilot-panel-buffer)) (setq copilot-panel-buffer (generate-new-buffer "*copilot*")))
     (let ((target-buffer (current-buffer)))
       (with-current-buffer copilot-panel-buffer
-        (setq copilot-panel--target-buffer target-buffer)))
+        (when (not (eq copilot-panel--target-buffer target-buffer))
+          (erase-buffer)
+          (setq copilot-panel--target-buffer target-buffer))))
     (setq copilot-panel-solutions--accumulator nil)
     (setq copilot-panel-solutions--ids (ht))
     (-some--> (copilot-shadow-eglot-server)
-      (jsonrpc-async-request it :getPanelCompletions
-                             (append
-                              (list
-                               :panelId "copilot:///1"
-                               :doc
-                               (list :path (buffer-file-name)
-                                     :position (eglot--pos-to-lsp-position)
-                                     :uri (eglot--path-to-uri (buffer-file-name)))
-                               )
-                              (eglot--TextDocumentPositionParams) nil)
-                             :deferred :getPanelCompletions))))
+      (when (process-live-p (jsonrpc--process it))
+        (jsonrpc-async-request it :getPanelCompletions
+                               (append
+                                (list
+                                 :panelId
+                                 (or
+                                  (ht-get copilot-buffer-to-panel-id (current-buffer))
+                                  (--doto (concat "copilot:///" (number-to-string copilot-panel-id-counter))
+                                    (setq copilot-panel-id-counter (1+ copilot-panel-id-counter))
+                                    (ht-set copilot-buffer-to-panel-id (current-buffer) it)))
+                                 :doc
+                                 (list :path (buffer-file-name)
+                                       :position (eglot--pos-to-lsp-position)
+                                       :uri (eglot--path-to-uri (buffer-file-name)))
+                                 )
+                                (eglot--TextDocumentPositionParams) nil)
+                               :deferred :getPanelCompletions)))))
 
 
 (defun copilot--first-token (text)
@@ -203,16 +233,15 @@ Used to dedupe the `copilot-panel-solutions--accumulator'.")
 (defun copilot-sort-results-company-transformer (results)
   "Company transformer for sorting results based on the output from copilot.
 See `company-transformers'."
-  (or results
-      (when results
-        (let ((copilot-results nil)
-              (normal-results nil))
-          (cl-loop for result in results
-                   do
-                   (if (ht-get copilot--result-token-cache (copilot--first-token result))
-                       (push result copilot-results)
-                     (push result normal-results)))
-          (append copilot-results normal-results nil)))))
+  (when results
+    (let ((copilot-results nil)
+          (normal-results nil))
+      (cl-loop for result in results
+               do
+               (if (ht-get copilot--result-token-cache (copilot--first-token result))
+                   (push result copilot-results)
+                 (push result normal-results)))
+      (append copilot-results normal-results nil))))
 
 (define-derived-mode copilot-shadow-mode fundamental-mode "copilot-shadow"
   "Mode used by shadow buffers for copilot.")
@@ -265,13 +294,12 @@ See `company-transformers'."
     (with-current-buffer current-buffer
       (setq-local before-change-functions (-uniq (cons #'copilot--before-change-hook before-change-functions)))
       (setq-local after-change-functions (-uniq (cons #'copilot--after-change-hook after-change-functions)))
-      (if (and copilot--shadow-buffer (buffer-live-p copilot--shadow-buffer)
-               )
-          (with-current-buffer copilot--shadow-buffer
-            (when (copilot-shadow--eglot-ensure (-some--> (eglot-current-server) (eglot--language-id it)))
-              copilot--shadow-buffer))
+      (if (and copilot--shadow-buffer (buffer-live-p copilot--shadow-buffer))
+          (let ((language-id "copilot"))
+            (prog1 
+                copilot--shadow-buffer))
         (let (
-              (language-id (-some--> (eglot-current-server) (eglot--language-id it)))
+              (language-id "copilot")
               (copied
                (progn
                  (widen)
@@ -297,6 +325,7 @@ See `company-transformers'."
                     (copilot-shadow-mode)
                     (set-buffer-modified-p nil)
                     (setq-local buffer-file-name file-name)
+                    (-message "Starting copilot")
                     (copilot-shadow--eglot-ensure language-id)
                     (eglot--maybe-activate-editing-mode)
                     (set-buffer-modified-p nil)
@@ -305,30 +334,35 @@ See `company-transformers'."
 (defun copilot-shadow--eglot-ensure (language-id)
   "Ensures that eglot is enabled. If it isn't, then start it for `copilot-shadow-mode'."
   (when language-id
-    (or (eglot-managed-p)
-        (and (eglot-current-server) (prog1 t (eglot--maybe-activate-editing-mode)))
+    (or (and (eglot-managed-p)
+             (string= language-id (eglot--language-id (eglot-current-server))))
+        (and (eglot-current-server)
+             (string= language-id (eglot--language-id (eglot-current-server)))
+             (prog1 t (eglot--maybe-activate-editing-mode)))
         (eglot
          #'copilot-shadow-mode
          (cons 'projectile
-               (project-root (project-current)))
+               (projectile-project-root))
          #'eglot-lsp-server
          (copilot-shadow-mode-server-command)
-         (or language-id "copilot") t))))
+         "copilot" t))))
 
 (defun copilot--before-change-hook (beg end)
   "before-change-functions hook for forwarding `eglot--before-change' to the shadow buffer."
-  (-some--> (copilot--shadow-buffer (current-buffer))
-    (let ((server it)
-          (copied (buffer-substring beg end)))
-      (with-current-buffer shadow
-          (ignore-errors (eglot--before-change beg end))))))
+  (when (copilot--enabled-in-buffer-p)
+    (-some--> (copilot--shadow-buffer (current-buffer))
+      (let ((shadow it)
+            (copied (buffer-substring beg end)))
+        (with-current-buffer shadow
+          (ignore-errors (eglot--before-change beg end)))))))
 
 (defun copilot--after-change-hook (beg end length)
   "after-change-functions hook for forwarding `eglot--after-change' to the shadow buffer."
-  (-some--> (copilot--shadow-buffer (current-buffer))
-    (let ((shadow it)
-          (copied (buffer-substring beg end)))
-      (with-current-buffer shadow
+  (when (copilot--enabled-in-buffer-p)
+    (-some--> (copilot--shadow-buffer (current-buffer))
+      (let ((shadow it)
+            (copied (buffer-substring beg end)))
+        (with-current-buffer shadow
           (let ((pt (point)))
             (save-excursion
               (let ((inhibit-modification-hooks t)
@@ -339,7 +373,7 @@ See `company-transformers'."
                 (insert copied)
                 (ignore-errors (eglot--after-change beg end length))
                 (set-buffer-modified-p nil)))
-            (goto-char pt))))))
+            (goto-char pt)))))))
 
 (defun copilot-shadow-kill-buffer-hook ()
   "Handles killing the copilot shadow buffer when the owner buffer is killed."
@@ -367,28 +401,36 @@ additional copilot methods like PanelSolution."
   (cl-defmethod eglot-handle-notification
     (server (_method (eql PanelSolution)) &rest params)
     "Handle server request PanelSolution for copilot panel."
-    (unless (ht-get copilot-panel-solutions--ids (plist-get params :solutionId))
-      (ht-set copilot-panel-solutions--ids (plist-get params :solutionId) t)
-      (push
-       (cons (plist-get params :score)
-             (propertize (concat (format "%.2f: " (plist-get params :score)) (plist-get params :displayText))
-                         :id (plist-get params :solutionId)
-                         :range (plist-get params :range)
-                         :insertText (plist-get params :completionText)))
-       copilot-panel-solutions--accumulator)
-      (copilot--update-result-cache)))
+    (when (string= (plist-get params :panelId)
+                   (ht-get copilot-buffer-to-panel-id (buffer-local-value 'copilot-panel--target-buffer copilot-panel-buffer)))
+      
+      (unless (ht-get copilot-panel-solutions--ids (plist-get params :solutionId))
+        (ht-set copilot-panel-solutions--ids (plist-get params :solutionId) t)
+        (push
+         (cons (plist-get params :score)
+               (propertize (concat (format "%.2f: " (plist-get params :score)) (plist-get params :displayText))
+                           :id (plist-get params :solutionId)
+                           :range (plist-get params :range)
+                           :insertText (plist-get params :completionText)))
+         copilot-panel-solutions--accumulator)
+        (copilot--update-result-cache)
+        (when copilot-panel-buffer
+          (with-current-buffer copilot-panel-buffer
+            (copilot-panel--generate-buffer))))))
 
   (cl-defmethod eglot-handle-notification
     (server (_method (eql PanelSolutionsDone)) &rest params)
     "Handle server request PanelSolution for copilot panel."
-    (when copilot-panel-solutions--accumulator
-      (setq copilot-panel-solutions (append copilot-panel-solutions--accumulator nil))
-      (setq copilot-panel-solutions--accumulator nil)
-      )
-    (copilot--update-result-cache)
-    (when copilot-panel-buffer
-      (with-current-buffer copilot-panel-buffer
-        (copilot-panel--generate-buffer)))))
+    (when (string= (plist-get params :panelId)
+                   (ht-get copilot-buffer-to-panel-id (buffer-local-value 'copilot-panel--target-buffer copilot-panel-buffer)))
+      (when copilot-panel-solutions--accumulator
+        (setq copilot-panel-solutions (append copilot-panel-solutions--accumulator nil))
+        (setq copilot-panel-solutions--accumulator nil)
+        )
+      (copilot--update-result-cache)
+      (when copilot-panel-buffer
+        (with-current-buffer copilot-panel-buffer
+          (copilot-panel--generate-buffer))))))
 
 (defun copilot-panel-select-at-point ()
   "Selects the entry at point in the copilot panel, and performs
@@ -455,5 +497,9 @@ add a face to the replacement."
       (erase-buffer)
       (insert buffer-string)
       (copilot--replace-text selection t))))
+
+(defun counsel-copilot--commit-action (selection)
+  "Counsel action for selecting a copilot preview."
+  (copilot--replace-text selection t))
 
 (provide 'copilot)
