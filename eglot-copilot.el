@@ -40,6 +40,9 @@ Used to dedupe the `copilot-panel-solutions--accumulator'.")
 (defvar copilot-panel--idle-timer nil
   "Timer that handles refreshing the copilot panel.")
 
+(defvar copilot--shadow-buffer-map (ht)
+  "Map of copilot buffers to their corresponding shadow buffers")
+
 (defvar-local copilot--shadow-buffer nil
   "Reference to the shadow buffer for the current buffer.")
 
@@ -173,6 +176,7 @@ Used to dedupe the `copilot-panel-solutions--accumulator'.")
        (not buffer-read-only)
        (buffer-file-name)
        (projectile-project-root)
+       (not (minibufferp))
        (not (string= "class" (file-name-extension (buffer-file-name))))
        (condition-case err (copilot--shadow-buffer (current-buffer))
          (error nil))))
@@ -249,7 +253,7 @@ See `company-transformers'."
 (defun copilot-shadow-eglot-server ()
   "Return the eglot server used by the shadow buffer for the current buffer."
 
-  (-some--> 
+  (-some-->
       (copilot--shadow-buffer (current-buffer))
       (with-current-buffer it
         (eglot-current-server))))
@@ -257,9 +261,11 @@ See `company-transformers'."
 (defun copilot-shadow-kill ()
   "Kills the shadow buffer for the current buffer."
   (interactive)
-  (when copilot--shadow-buffer
-    (kill-buffer copilot--shadow-buffer)
-    (setq copilot--shadow-buffer nil)))
+  (let ((file-name (buffer-file-name)))
+     (-some--> (ht-get copilot--shadow-buffer-map (buffer-file-name))
+      (progn
+        (kill-buffer it)
+        (ht-remove copilot--shadow-buffer-map file-name)))))
 
 (defun copilot-shadow-clean ()
   "Kills all copilot buffers and corresponding eglot processes"
@@ -290,46 +296,51 @@ See `company-transformers'."
 
 (defun copilot--shadow-buffer (current-buffer)
   "Return the shadow buffer for the current buffer. Creates it if it does not exist."
-  (save-mark-and-excursion
-    (with-current-buffer current-buffer
-      (setq-local before-change-functions (-uniq (cons #'copilot--before-change-hook before-change-functions)))
-      (setq-local after-change-functions (-uniq (cons #'copilot--after-change-hook after-change-functions)))
-      (if (and copilot--shadow-buffer (buffer-live-p copilot--shadow-buffer))
-          (let ((language-id "copilot"))
-            (prog1 
-                copilot--shadow-buffer))
-        (let (
-              (language-id "copilot")
-              (copied
-               (progn
-                 (widen)
-                 (buffer-string)))
-             (file-name (buffer-file-name)))
-          (unless (f-exists-p copilot-node-agent-script)
-            (user-error (concat "`copilot-node-agent-script': " (format "%S" copilot-node-agent-script) " Does Not Exist.")))
-          (unless (executable-find copilot-node-program)
-            (user-error (concat "`copilot-node-program': " (format "%S" copilot-node-program) " Not Found in `exec-path'.")))
-          (let ((node-version
-                 (-some-->
-                     (shell-command-to-string (s-join " " (list copilot-node-program "--version")))
-                     (string-trim it)
-                     (s-split-up-to (rx ".") it 1)
-                     (car it)
-                     (substring it 1)
-                     (string-to-number it))))
-            (when (> node-version 18) (user-error "Node version should be less than v18"))
-            (setq copilot--shadow-buffer
-                  (with-current-buffer
-                      (generate-new-buffer (concat " *copilot shadow " (buffer-name) "*"))
-                    (insert copied)
-                    (copilot-shadow-mode)
-                    (set-buffer-modified-p nil)
-                    (setq-local buffer-file-name file-name)
-                    (-message "Starting copilot")
-                    (copilot-shadow--eglot-ensure language-id)
-                    (eglot--maybe-activate-editing-mode)
-                    (set-buffer-modified-p nil)
-                    (current-buffer)))))))))
+  (when (and current-buffer (buffer-live-p current-buffer))
+    (save-mark-and-excursion
+      (with-current-buffer current-buffer
+        (setq-local before-change-functions (-uniq (cons #'copilot--before-change-hook before-change-functions)))
+        (setq-local after-change-functions (-uniq (cons #'copilot--after-change-hook after-change-functions)))
+        (or (let ((language-id "copilot"))
+              (-some-->
+                  (ht-get copilot--shadow-buffer-map (buffer-file-name current-buffer))
+                (when (buffer-live-p it) it)))
+            (let (
+                  (language-id "copilot")
+                  (copied
+                   (progn
+                     (widen)
+                     (buffer-string)))
+                  (file-name (buffer-file-name)))
+              (unless (f-exists-p copilot-node-agent-script)
+                (user-error (concat "`copilot-node-agent-script': " (format "%S" copilot-node-agent-script) " Does Not Exist.")))
+              (unless (executable-find copilot-node-program)
+                (user-error (concat "`copilot-node-program': " (format "%S" copilot-node-program) " Not Found in `exec-path'.")))
+              (let ((node-version
+                     (-some-->
+                         (shell-command-to-string (s-join " " (list copilot-node-program "--version")))
+                       (string-trim it)
+                       (s-split-up-to (rx ".") it 1)
+                       (car it)
+                       (substring it 1)
+                       (string-to-number it))))
+                (when (> node-version 18) (user-error "Node version should be less than v18"))
+                (-some--> (ht-get copilot--shadow-buffer-map file-name)
+                  (when (buffer-live-p it) (kill-buffer it)))
+                (let ((buffer (with-current-buffer
+                                  (generate-new-buffer (concat " *copilot shadow " (buffer-name) "*"))
+                                (insert copied)
+                                (copilot-shadow-mode)
+                                (set-buffer-modified-p nil)
+                                (setq-local buffer-file-name file-name)
+                                (-message "Starting copilot")
+                                (copilot-shadow--eglot-ensure language-id)
+                                (eglot--maybe-activate-editing-mode)
+                                (set-buffer-modified-p nil)
+                                (current-buffer))))
+                  (ht-set copilot--shadow-buffer-map
+                          file-name
+                          buffer)))))))))
 
 (defun copilot-shadow--eglot-ensure (language-id)
   "Ensures that eglot is enabled. If it isn't, then start it for `copilot-shadow-mode'."
@@ -369,7 +380,9 @@ See `company-transformers'."
                     (inhibit-point-motion-hooks t)
                     (inhibit-read-only t))
                 (goto-char beg)
-                (delete-char length)
+                (condition-case nil
+                    (delete-char length)
+                  (end-of-buffer nil))
                 (insert copied)
                 (ignore-errors (eglot--after-change beg end length))
                 (set-buffer-modified-p nil)))
@@ -377,8 +390,12 @@ See `company-transformers'."
 
 (defun copilot-shadow-kill-buffer-hook ()
   "Handles killing the copilot shadow buffer when the owner buffer is killed."
-  (when copilot--shadow-buffer
-    (kill-buffer copilot--shadow-buffer)))
+  (let ((file-name (buffer-file-name)))
+    (-some--> file-name
+      (ht-get copilot--shadow-buffer-map it)
+      (progn
+        (ht-remove copilot--shadow-buffer-map file-name)
+        (when (buffer-live-p it) (kill-buffer it))))))
 
 (defun copilot-shadow-mode-server-command (&rest arg)
   "Return the command to run copilot for eglot.
@@ -502,4 +519,4 @@ add a face to the replacement."
   "Counsel action for selecting a copilot preview."
   (copilot--replace-text selection t))
 
-(provide 'copilot)
+(provide 'eglot-copilot)
