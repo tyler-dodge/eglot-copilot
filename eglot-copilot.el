@@ -3,7 +3,7 @@
 ;; Author: Tyler Dodge (tyler@tdodge.consulting)
 ;; Version: 0.1
 ;; Keywords: convenience
-;; Package-Requires: ((emacs "26.1") (uuid "0.0.3") (deferred "0.5.1") (s "1.12.0") (dash "2.19.1"))
+;; Package-Requires: ((emacs "28.2") (f "0.20.0") (bash-completion "3.1.0") (projectile "2.6.0-snapshot") (s "1.12.0") (company "0.9.13") (eglot-copilot "0.1") (dash "2.19.1") (ht "2.4"))
 ;; URL: https://github.com/tyler-dodge/eglot-copilot
 ;; Git-Repository: git://github.com/tyler-dodge/eglot-copilot.git
 ;; This program is free software; you can redistribute it and/or modify
@@ -22,6 +22,17 @@
 ;;;
 ;;;
 ;;; Commentary:
+;;; `eglot-copilot-setup' Handles integration with emacs. 
+;;; <example>
+;;; (eglot-copilot-setup)
+;;; </example>
+;;; `eglot-copilot-node-agent-script' will need to be updated to point to an copilot agent.js.
+;;; An example can be found at https://github.com/github/copilot.vim/blob/release/copilot/dist/agent.js
+;;;
+;;; This package provides a company transformer named `eglot-copilot-sort-results-company-transformer' 
+;;; which takes the results of the copilot panel, and sorts the company candidates based on their presence in
+;;; the copilot panel. 
+;;; It is added to the transformer list by default in `eglot-copilot-setup'
 ;;; Code:
 
 
@@ -29,6 +40,7 @@
 (require 'ht)
 (require 'dash)
 (require 'eieio)
+(require 'eglot)
 
 (defcustom eglot-copilot-node-program "node"
   "Path to node executable used to run the copilot agent.
@@ -90,10 +102,9 @@ Used to dedupe the `eglot-copilot-panel-solutions--accumulator'.")
   "Setup the copilot integration to ensure the best user experience."
   (add-to-list 'eglot-server-programs '(eglot-copilot-shadow-mode . eglot-copilot-shadow-mode-server-command))
   (push #'eglot-copilot-sort-results-company-transformer company-transformers)
-  (push 'eglot-copilot-shadow-kill-buffer-hook kill-buffer-hook)
+  (add-hook 'eglot-copilot-shadow-kill-buffer-hook kill-buffer-hook)
   (when (fboundp #'ivy-set-actions)
     (ivy-set-actions 'eglot-copilot-counsel '(("c" eglot-copilot-counsel--commit-action "Commit"))))
-  (eglot-copilot-install-eglot-extension)
   (eglot-copilot--start-panel-refresh-timer))
 
 ;;;###autoload
@@ -358,12 +369,17 @@ Creates it if it does not exist."
                      (buffer-string)))
                   (file-name (buffer-file-name)))
               (unless (f-exists-p eglot-copilot-node-agent-script)
-                (user-error (concat "`eglot-copilot-node-agent-script': " (format "%S" eglot-copilot-node-agent-script) " Does Not Exist.")))
+                (user-error (concat "`eglot-copilot-node-agent-script': "
+                                    (format "%S" eglot-copilot-node-agent-script)
+                                    " Does Not Exist.")))
               (unless (executable-find eglot-copilot-node-program)
-                (user-error (concat "`eglot-copilot-node-program': " (format "%S" eglot-copilot-node-program) " Not Found in `exec-path'.")))
+                (user-error (concat "`eglot-copilot-node-program': "
+                                    (format "%S" eglot-copilot-node-program)
+                                    " Not Found in `exec-path'.")))
               (let ((node-version
                      (-some-->
-                         (shell-command-to-string (s-join " " (list eglot-copilot-node-program "--version")))
+                         (shell-command-to-string
+                          (s-join " " (list eglot-copilot-node-program "--version")))
                        (string-trim it)
                        (s-split-up-to (rx ".") it 1)
                        (car it)
@@ -468,48 +484,44 @@ Designed to worked with `eglot-server-programs'."
          (lambda (&rest arg)
            (eglot-copilot-panel-refresh)))))
 
-(defun eglot-copilot-install-eglot-extension ()
-  "Defines the method overrides to work with eglot for the
-additional copilot methods like PanelSolution."
-  (cl-defmethod eglot-handle-notification
-    (server (_method (eql PanelSolution)) &rest params)
-    "Handle server request PanelSolution for copilot panel."
-    (when (string= (plist-get params :panelId)
-                   (ht-get eglot-copilot-buffer-to-panel-id
-                           (buffer-local-value 'eglot-copilot-panel--target-buffer
-                                               eglot-copilot-panel-buffer)))
-      (unless (ht-get eglot-copilot-panel-solutions--ids (plist-get params :solutionId))
-        (ht-set eglot-copilot-panel-solutions--ids (plist-get params :solutionId) t)
-        (push
-         (cons (plist-get params :score)
-               (propertize (concat (format "%.2f: " (plist-get params :score))
-                                   (plist-get params :displayText))
-                           :id (plist-get params :solutionId)
-                           :range (plist-get params :range)
-                           :insertText (plist-get params :completionText)))
-         eglot-copilot-panel-solutions--accumulator)
-        (eglot-copilot--update-result-cache))
-      (when eglot-copilot-panel-buffer
-        (with-current-buffer eglot-copilot-panel-buffer
-          (eglot-copilot-panel--generate-buffer)))))
+(cl-defmethod eglot-handle-notification
+  ((server eglot-copilot-lsp-server) (_method (eql PanelSolution)) &rest params)
+  "Handle server request PanelSolution for copilot panel."
+  (when (string= (plist-get params :panelId)
+                 (ht-get eglot-copilot-buffer-to-panel-id
+                         (buffer-local-value 'eglot-copilot-panel--target-buffer
+                                             eglot-copilot-panel-buffer)))
+    (unless (ht-get eglot-copilot-panel-solutions--ids (plist-get params :solutionId))
+      (ht-set eglot-copilot-panel-solutions--ids (plist-get params :solutionId) t)
+      (push
+       (cons (plist-get params :score)
+             (propertize (concat (format "%.2f: " (plist-get params :score))
+                                 (plist-get params :displayText))
+                         :id (plist-get params :solutionId)
+                         :range (plist-get params :range)
+                         :insertText (plist-get params :completionText)))
+       eglot-copilot-panel-solutions--accumulator)
+      (eglot-copilot--update-result-cache))
+    (when eglot-copilot-panel-buffer
+      (with-current-buffer eglot-copilot-panel-buffer
+        (eglot-copilot-panel--generate-buffer)))))
 
-  (cl-defmethod eglot-handle-notification
-    (server (_method (eql PanelSolutionsDone)) &rest params)
-    "Handle server request PanelSolution for copilot panel."
-    (when (string= (plist-get params :panelId)
-                   (ht-get eglot-copilot-buffer-to-panel-id
-                           (buffer-local-value 'eglot-copilot-panel--target-buffer
-                                               eglot-copilot-panel-buffer)))
-      (when eglot-copilot-panel-solutions--accumulator
-        (setq eglot-copilot-panel-solutions (append eglot-copilot-panel-solutions--accumulator nil))
-        (setq eglot-copilot-panel-solutions--state "COMPLETE")
-        (setq eglot-copilot-panel-solutions--accumulator nil)
-        )
-      (eglot-copilot--update-result-cache)
-      (when eglot-copilot-panel-buffer
-        (with-current-buffer eglot-copilot-panel-buffer
-          (eglot-copilot-panel--generate-buffer))))))
-
+(cl-defmethod eglot-handle-notification
+  ((server eglot-copilot-lsp-server) (_method (eql PanelSolutionsDone)) &rest params)
+  "Handle server request PanelSolution for copilot panel."
+  (when (string= (plist-get params :panelId)
+                 (ht-get eglot-copilot-buffer-to-panel-id
+                         (buffer-local-value 'eglot-copilot-panel--target-buffer
+                                             eglot-copilot-panel-buffer)))
+    (when eglot-copilot-panel-solutions--accumulator
+      (setq eglot-copilot-panel-solutions (append eglot-copilot-panel-solutions--accumulator nil))
+      (setq eglot-copilot-panel-solutions--state "COMPLETE")
+      (setq eglot-copilot-panel-solutions--accumulator nil)
+      )
+    (eglot-copilot--update-result-cache)
+    (when eglot-copilot-panel-buffer
+      (with-current-buffer eglot-copilot-panel-buffer
+        (eglot-copilot-panel--generate-buffer)))))
 (defun eglot-copilot-panel-select-at-point ()
   "Selects the entry at point in the copilot panel, and performs
 the replacement in the target buffer for the panel."
@@ -549,9 +561,16 @@ add a face to the replacement."
          (inhibit-modification-hooks t)
         (insert-text (get-text-property 0 :insertText selection)))
     (when insert-text
-      (let* ((start-pt (save-excursion (goto-char (eglot-copilot--lsp-position-to-point (plist-get range :start))) (forward-line 0) (point)))
-             (start-window-pt (save-excursion (goto-char start-pt) (ignore-errors (forward-line -3)) (point)))
-             (end-pt (save-excursion (goto-char (eglot-copilot--lsp-position-to-point (plist-get range :end))) (end-of-line) (1+ (point)))))
+      (let* ((start-pt (save-excursion
+                         (goto-char (eglot-copilot--lsp-position-to-point (plist-get range :start)))
+                         (forward-line 0)
+                         (point)))
+             (start-window-pt (save-excursion (goto-char start-pt)
+                                              (ignore-errors (forward-line -3))
+                                              (point)))
+             (end-pt (save-excursion (goto-char (eglot-copilot--lsp-position-to-point (plist-get range :end)))
+                                     (end-of-line)
+                                     (1+ (point)))))
         (goto-char start-pt)
         (atomic-change-group
           (delete-region start-pt end-pt)

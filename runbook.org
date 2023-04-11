@@ -1,0 +1,9 @@
+* Test 28.2                                                             :PTY:
+#+BEGIN_SRC compile-queue
+    set -o errexit
+    set -o pipefail
+    set -o nounset
+    cd {{project_root}}
+    nix-build nix/emacs-28.2.nix
+
+#+END_SRC
